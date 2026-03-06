@@ -53,6 +53,7 @@ internal class ResumptionInternal<Res, Ret> <: Resumption<Res, Ret> {
             throw DoubleResumeException()
         }
         this.handler.response = r
+        this.handler.responseReady.store(true)
         this.handler.frame.parent = HandlerFrame.getActiveFrame()
         this.handler.frame.handlerThread = unsafe { CJ_MRT_GetCurrentCJThread() }
         unsafe { CJ_MRT_ThreadResumeAndWait(this.waitingThread) }
@@ -82,6 +83,8 @@ abstract class DeferredHandlerCase0<Ret> <: HandlerCase {
 abstract class DeferredHandlerCase1<Res, Ret> <: DeferredHandlerCase0<Ret> {
     DeferredHandlerCase1(let frame: DeferredFrame<Ret>) {}
     var response: HandlerResponse<Res> = Invalid
+    // Ensures handler's write to response is visible to handlee before it reads (memory ordering).
+    var responseReady = AtomicBool(false)
 }
 
 class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
@@ -96,7 +99,9 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
             case Some(cmd) =>
                 this.command = cmd
                 this.resumption = ResumptionInternal<Res, Ret>(this)
+                this.responseReady.store(false)
                 this.frame.request(Perform(this))
+                this.responseReady.load()
                 this.response.unpack<R1>()
             case None => None
         }
