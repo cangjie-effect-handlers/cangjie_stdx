@@ -8,9 +8,27 @@
 
 package stdx.effect
 
-internal import std.sync.AtomicBool
+internal import std.sync.{AtomicBool, AtomicReference}
 
 private type ThreadHandle = CPointer<Unit>
+
+// Thread-local capture of resumption before request(); read after wake so we never rely on this.resumption after the handler runs.
+private class PendingResumptionBox {
+    var ref: Option<Object> = None
+    init() {}
+}
+private class PendingResumptionHolder {
+    static let PENDING_RESUMPTION_KEY = ThreadLocal<PendingResumptionBox>()
+    static func getPendingResumptionBox(): PendingResumptionBox {
+        match (PENDING_RESUMPTION_KEY.get()) {
+            case Some(box) => box
+            case None =>
+                let box = PendingResumptionBox()
+                PENDING_RESUMPTION_KEY.set(box)
+                box
+        }
+    }
+}
 
 @FastNative
 foreign func CJ_MRT_GetCurrentCJThread(): ThreadHandle
@@ -28,7 +46,15 @@ foreign func CJ_MRT_ThreadReady(readyThread: ThreadHandle): Unit
 foreign func CJ_MRT_GetCJThreadState(thread: ThreadHandle): Int64
 
 enum HandlerResponse<Res> {
-    Resume(Res) | Throw(Exception) | Abort(Error) | Invalid
+    Invalid | Resume(Res) | Throw(Exception) | Abort(Error)
+}
+
+// Box used so handler's write to response is visible to handlee via atomic store/load (memory ordering).
+internal class ResponseBox<Res> {
+    var r: HandlerResponse<Res> = Invalid
+    init(r: HandlerResponse<Res>) {
+        this.r = r
+    }
 }
 
 extend<Res> HandlerResponse<Res> {
@@ -45,6 +71,8 @@ extend<Res> HandlerResponse<Res> {
 internal class ResumptionInternal<Res, Ret> <: Resumption<Res, Ret> {
     let used = AtomicBool(false)
     let waitingThread = unsafe { CJ_MRT_GetCurrentCJThread() }
+    // Response lives here so handlee reads from the same object it holds (this.resumption), avoiding handler-case visibility/corruption.
+    var responseHolder = AtomicReference<ResponseBox<Res>>(ResponseBox<Res>(HandlerResponse<Res>.Invalid))
     ResumptionInternal(let handler: DeferredHandlerCase1<Res, Ret>) {}
 
     func respond(r: HandlerResponse<Res>): Ret {
@@ -52,8 +80,9 @@ internal class ResumptionInternal<Res, Ret> <: Resumption<Res, Ret> {
         if (this.used.swap(true)) {
             throw DoubleResumeException()
         }
-        this.handler.response = r
-        this.handler.responseReady.store(true)
+        let box = this.responseHolder.load()
+        box.r = r
+        this.responseHolder.store(box)
         this.handler.frame.parent = HandlerFrame.getActiveFrame()
         this.handler.frame.handlerThread = unsafe { CJ_MRT_GetCurrentCJThread() }
         unsafe { CJ_MRT_ThreadResumeAndWait(this.waitingThread) }
@@ -82,9 +111,6 @@ abstract class DeferredHandlerCase0<Ret> <: HandlerCase {
 
 abstract class DeferredHandlerCase1<Res, Ret> <: DeferredHandlerCase0<Ret> {
     DeferredHandlerCase1(let frame: DeferredFrame<Ret>) {}
-    var response: HandlerResponse<Res> = Invalid
-    // Ensures handler's write to response is visible to handlee before it reads (memory ordering).
-    var responseReady = AtomicBool(false)
 }
 
 class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
@@ -99,10 +125,20 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
             case Some(cmd) =>
                 this.command = cmd
                 this.resumption = ResumptionInternal<Res, Ret>(this)
-                this.responseReady.store(false)
+                let resumptionToUse = this.resumption.getOrThrow()
+                let pendingBox = PendingResumptionHolder.getPendingResumptionBox()
+                pendingBox.ref = (resumptionToUse as Object)
                 this.frame.request(Perform(this))
-                this.responseReady.load()
-                this.response.unpack<R1>()
+                match (PendingResumptionHolder.getPendingResumptionBox().ref) {
+                    case Some(obj) =>
+                        pendingBox.ref = None
+                        let res = (obj as ResumptionInternal<Res, Ret>).getOrThrow()
+                        let resp = res.responseHolder.load()
+                        let responseVal = resp.r
+                        this.resumption = None
+                        responseVal.unpack<R1>()
+                    case None => throw Exception("INTERNAL ERROR: missing pending resumption")
+                }
             case None => None
         }
     }
@@ -112,7 +148,7 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
         let cmd = this.command.getOrThrow()
         this.command = None
         let res = this.resumption.getOrThrow()
-        this.resumption = None
+        // Do not clear this.resumption here; handlee reads response from res, then respond() clears it.
         this.h(cmd, res)
     }
 }
