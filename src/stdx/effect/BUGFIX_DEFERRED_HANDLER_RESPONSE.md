@@ -1,8 +1,12 @@
-# Bugfix: Deferred effect handler response visibility and segfaults
+# Bugfix: Deferred effect handler response/request visibility and segfaults
 
 ## Summary
 
-This document describes a fix for intermittent **INTERNAL ERROR: invalid handler response** and **segfaults** in the deferred effect implementation (`stdx/effect/deferred.cj`). The fix has three parts: (1) making the handler response visible across threads using atomic reference and a response box, (2) storing the response on the resumption object and reading it via a thread-local so the handlee never relies on the handler-case object after wake-up, and (3) Cangjie-specific type and enum ordering details.
+This document describes a fix for intermittent **INTERNAL ERROR: invalid handler response** / **invalid handler request** and **segfaults** in the deferred effect implementation (`stdx/effect/deferred.cj`). The fix has four parts: (1) making the handler response visible across threads using atomic reference and a response box, (2) storing the response on the resumption object and reading it via a thread-local so the handlee never relies on the handler-case object after wake-up, (3) the same visibility and thread-local pattern for the **Request** path and for the **handler** after it wakes from `ThreadWait()`, and (4) Cangjie-specific type and enum ordering details.
+
+- **Request path:** The handlee’s write to the request must be visible to the handler. The frame holds the request in a `RequestBox<Ret>` inside an `AtomicReference` (`requestHolder`). The handlee loads the box, sets `box.r = req`, stores the box, then resumes the handler; the handler reads via `requestHolder.load()` and `box.r`. No separate “requestReady” flag is used—synchronization is from the atomic store/load of the box only.
+
+- **Handler wake segfaults:** After the handler thread is resumed from `CJ_MRT_ThreadWait()` in `start()`, using `this` (the `DeferredFrame`) can be unsafe. The handler stores the frame in a **thread-local** (`PendingFrameBox` / `PendingFrameHolder`) before waiting, and after wake retrieves the frame from the thread-local and calls `frame.mainLoop()` instead of `this.mainLoop()`.
 
 ---
 
@@ -27,6 +31,9 @@ So the handlee relied on a plain (non-atomic) write to `response` on another thr
 
 2. **Segfaults after “request() returned”**  
    After moving the response into an atomic reference and a shared box, the handlee sometimes crashed when reading the response (e.g. when loading from `this.responseHolder` or accessing the loaded object). So in addition to visibility, there was a **correctness/lifetime** issue: after the handlee is resumed, using **`this` (the handler case)** or **`this.responseHolder` / `this.resumption`** to reach the response could be unsafe (wrong object, torn state, or bad reference). The fix is to **never depend on the handler-case or its fields after the wake**: the handlee must get the resumption (and thus the response) from a **thread-local** that was set **before** calling `request()`.
+
+3. **Segfaults after handler wake**  
+   The handler thread blocks in `start()` on `CJ_MRT_ThreadWait()`. When the handlee resumes it, the handler continues and originally called `this.mainLoop()`. Using **`this` (the frame)** after wake can be similarly unsafe. The fix is to store the frame in a **thread-local** before `ThreadWait()` and, after wake, retrieve the frame from the thread-local and call `frame.mainLoop()` instead of using `this`.
 
 ---
 
@@ -63,6 +70,21 @@ Mark both classes `private` so they are implementation detail.
 
 ---
 
+### 2b. Thread-local for pending frame (handler)
+
+**Purpose:** The handler must not use `this` (the `DeferredFrame`) after it is resumed from `ThreadWait()`. It must use a frame reference that it stored in its own thread before blocking.
+
+Add (after the resumption thread-local types, before `@FastNative`):
+
+- `PendingFrameBox`: class with `var ref: Option<Object> = None` and `init() {}`.
+- `PendingFrameHolder`: class with:
+  - `static let PENDING_FRAME_KEY = ThreadLocal<PendingFrameBox>()`
+  - `static func getPendingFrameBox(): PendingFrameBox` (same pattern as `getPendingResumptionBox()`).
+
+Mark both classes `private`.
+
+---
+
 ### 3. Response type and box (memory ordering)
 
 **Purpose:** The handler’s write to the response must be visible to the handlee. Use a **single** response value stored in a **reference type** and communicate it via **atomic store/load** so the runtime’s memory model orders the handler’s write before the handlee’s read.
@@ -83,21 +105,15 @@ Mark both classes `private` so they are implementation detail.
 
 ### 4. ResumptionInternal: hold response and use same box
 
-**Purpose:** The response is stored on the **resumption** object (same object the handlee will later read via thread-local), and the handler updates the **same** box reference (no per-call allocation) for correct memory ordering. The original has no `responseReady` anywhere; the fix introduces both `responseHolder` and `responseReady` on `ResumptionInternal`.
+**Purpose:** The response is stored on the **resumption** object (same object the handlee will later read via thread-local), and the handler updates the **same** box reference (no per-call allocation) for correct memory ordering. No separate “responseReady” flag is used—synchronization is from the atomic store/load of the box only.
 
 - **Fields on ResumptionInternal<Res, Ret>:**
   - Keep: `used`, `waitingThread`, and constructor taking the handler case.
-  - **Add** (neither exists in the original):
-    - `var responseHolder = AtomicReference<ResponseBox<Res>>(ResponseBox<Res>(HandlerResponse<Res>.Invalid))`
-    - `var responseReady = AtomicBool(false)`
+  - **Add:** `var responseHolder = AtomicReference<ResponseBox<Res>>(ResponseBox<Res>(HandlerResponse<Res>.Invalid))`
 
 - **respond(r: HandlerResponse<Res>):**
   - Check double-resume with `this.used.swap(true)` as before.
-  - Then:
-    - `let box = this.responseHolder.load()`
-    - `box.r = r`
-    - `this.responseHolder.store(box)`
-    - `this.responseReady.store(true)`
+  - Then: `let box = this.responseHolder.load()`, `box.r = r`, `this.responseHolder.store(box)`.
   - Then set frame parent and handler thread, call `CJ_MRT_ThreadResumeAndWait(this.waitingThread)`, then `this.handler.frame.mainLoop()`.
   - Do **not** write or read response on the handler case; only on `this` (ResumptionInternal).
 
@@ -105,7 +121,7 @@ Mark both classes `private` so they are implementation detail.
 
 ### 5. DeferredHandlerCase1: remove response state
 
-- **Remove** from `DeferredHandlerCase1<Res, Ret>` the **`response`** field (the original has only this; there is no `responseReady` in the original). After the fix, only `ResumptionInternal` holds response state (`responseHolder` and `responseReady`).
+- **Remove** from `DeferredHandlerCase1<Res, Ret>` the **`response`** field. After the fix, only `ResumptionInternal` holds response state (`responseHolder`).
 
 ---
 
@@ -136,7 +152,7 @@ In the branch where the command is `Some(cmd)`:
          - Return `Some(responseVal.unpack<R1>())`.
        - `case None`: throw an exception (e.g. "INTERNAL ERROR: missing pending resumption").
 
-So the handlee never touches `this.responseHolder` or `this.responseReady`; it only uses the resumption reference stored in the thread-local and then reads `res.responseHolder` and `res.responseReady` / `resp.r`.
+So the handlee never touches handler-case response state; it only uses the resumption reference stored in the thread-local and then reads `res.responseHolder` and `resp.r`.
 
 ---
 
@@ -147,16 +163,47 @@ So the handlee never touches `this.responseHolder` or `this.responseReady`; it o
 
 ---
 
-### 8. Enum and type quirks (Cangjie)
+### 8. Request path: RequestBox and requestHolder
+
+**Purpose:** The handlee’s write to the request must be visible to the handler. Use the same pattern as Response: a box in an atomic reference. No separate “requestReady” flag—synchronization is from the atomic store/load of the box only.
+
+- **RequestBox<Ret>:** Internal class with `var r: HandlerRequest<Ret> = HandlerRequest<Ret>.Invalid` and `init(r: HandlerRequest<Ret>) { this.r = r }`.
+
+- **DeferredFrame<Ret>:** Replace the plain `handlerRequest` field with:
+  - `var requestHolder = AtomicReference<RequestBox<Ret>>(RequestBox<Ret>(HandlerRequest<Ret>.Invalid))`
+
+- **request(req: HandlerRequest<Ret>)** (handlee): `let box = this.requestHolder.load()`, `box.r = req`, `this.requestHolder.store(box)`, then the existing wait loop and `CJ_MRT_ThreadResumeAndWait(this.handlerThread)`.
+
+- **mainLoop()** (handler): Read the request from the atomic, not from a plain field: `let box = this.requestHolder.load()`, `let requestVal = box.r`, then `match (requestVal) { ... }`.
+
+---
+
+### 9. start(): frame in thread-local before and after ThreadWait
+
+**Purpose:** After the handler is resumed from `CJ_MRT_ThreadWait()`, do not use `this` (the frame). Use the frame reference stored in the handler’s thread-local before the wait.
+
+- **Before** `unsafe { CJ_MRT_ThreadWait() }` in `start()`:
+  - `let pendingFrameBox = PendingFrameHolder.getPendingFrameBox()`
+  - `pendingFrameBox.ref = (this as Object)`
+
+- **After** `CJ_MRT_ThreadWait()` returns:
+  - Do **not** call `this.mainLoop()`.
+  - `match (PendingFrameHolder.getPendingFrameBox().ref)`:
+    - `case Some(obj)`: set `pendingFrameBox.ref = None`, `let frame = (obj as DeferredFrame<Ret>).getOrThrow()`, then `frame.mainLoop()` (and return its result).
+    - `case None`: throw `Exception("INTERNAL ERROR: missing pending frame")`.
+
+---
+
+### 10. Enum and type quirks (Cangjie)
 
 - **Invalid disambiguation:**  
-  If the compiler reports “multiple constructor 'Invalid'”, both `HandlerResponse<Res>` and `HandlerRequest<Ret>` may define `Invalid`. At use sites, use the fully qualified variant, e.g. `HandlerResponse<Res>.Invalid` and `HandlerRequest<Ret>.Invalid` where needed (e.g. initial values for `ResponseBox` and `handlerRequest`).
+  If the compiler reports “multiple constructor 'Invalid'”, both `HandlerResponse<Res>` and `HandlerRequest<Ret>` may define `Invalid`. At use sites, use the fully qualified variant, e.g. `HandlerResponse<Res>.Invalid` and `HandlerRequest<Ret>.Invalid` where needed (e.g. initial values for `ResponseBox`, `RequestBox`, and request holder).
 
 - **HandlerRequest enum order:**  
   Keep `Invalid` as the **last** variant of `HandlerRequest<Ret>` (e.g. `| Perform(...) | Return(...) | Throw(...) | Abort(...) Invalid`) so that the original enum order is preserved and qualified names still resolve correctly.
 
 - **Option / cast types:**  
-  If `(x as Object)` is already `Option<Object>`, assign it directly to `pendingBox.ref` without wrapping in `Some(...)`. If `(obj as ResumptionInternal<Res, Ret>)` is typed as an option, call `.getOrThrow()` so that `res` has type `ResumptionInternal<Res, Ret>` and you can access `responseReady` and `responseHolder`.
+  If `(x as Object)` is already `Option<Object>`, assign it directly to `pendingBox.ref` without wrapping in `Some(...)`. If `(obj as ResumptionInternal<Res, Ret>)` or `(obj as DeferredFrame<Ret>)` is typed as an option, call `.getOrThrow()` so you get the concrete type and can access `responseHolder` or call `frame.mainLoop()`.
 
 ---
 
@@ -177,17 +224,23 @@ So the handlee never touches `this.responseHolder` or `this.responseReady`; it o
 5. **Not clearing resumption in fulfill():**  
    The handlee needs to reach the same resumption object after wake; that reference is stored in the thread-local before `request()`. We only clear `this.resumption` on the handlee side after the response has been read, so the object remains valid for the duration of the read.
 
+6. **Request path: atomic box only.**  
+   Same as response: the handlee’s write is made visible to the handler by storing the request in a box and using an atomic store (of the box) after writing `box.r`. No separate “requestReady” (or “responseReady”) flag is used; the atomic load/store of the box provides the necessary synchronization.
+
+7. **Thread-local for handler frame after wake:**  
+   After the handler thread is resumed from `ThreadWait()`, we do not trust `this` (the frame) to be a valid reference. By storing the frame in a thread-local before the wait and reading it after wake, the handler always uses the reference it stored itself, avoiding segfaults from a bad or torn frame reference.
+
 ---
 
 ## Files touched
 
 - **`cangjie_stdx/src/stdx/effect/deferred.cj`**  
-  All changes are in this file (thread-local types, ResponseBox, ResumptionInternal response fields, tryHandle and fulfill logic, and any enum/type adjustments above).
+  All changes are in this file: thread-local types (PendingResumptionBox/Holder, PendingFrameBox/Holder), ResponseBox and RequestBox, ResumptionInternal.responseHolder, DeferredFrame.requestHolder, tryHandle and fulfill logic, request() and mainLoop() for the request path, start() frame thread-local before/after ThreadWait, and any enum/type adjustments above.
 
 ---
 
 ## Verification
 
 - Build: `cjpm build`.
-- Run tests or scenarios that use deferred effects (e.g. resumptions over the network). You should no longer see INTERNAL ERROR from “invalid handler response” or segfaults in `tryHandle` after “request() returned”.
+- Run tests or scenarios that use deferred effects (e.g. resumptions over the network). You should no longer see INTERNAL ERROR from “invalid handler response” or “invalid handler request”, or segfaults in `tryHandle` after “request() returned” or in the handler after wake from `ThreadWait()`.
 - Do not add debug prints or change enum variant order except as specified (keep `HandlerRequest` with `Invalid` last).
