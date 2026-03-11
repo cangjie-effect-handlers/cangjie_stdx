@@ -147,25 +147,25 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
     var resumption: Option<ResumptionInternal<Res, Ret>> = None
     protected override func tryHandle<R1>(maybeCmd: Command<R1>, box!: FrameBox): Option<R1> {
         // EXECUTED BY HANDLEE
-        match (maybeCmd as Cmd) {
-            case Some(cmd) =>
-                this.command = cmd
-                this.resumption = ResumptionInternal<Res, Ret>(this)
-                let resumptionToUse = this.resumption.getOrThrow()
-                let pendingBox = PendingResumptionHolder.getPendingResumptionBox()
-                pendingBox.ref = (resumptionToUse as Object)
-                this.frame.request(Perform(this))
-                match (PendingResumptionHolder.getPendingResumptionBox().ref) {
-                    case Some(obj) =>
-                        pendingBox.ref = None
-                        let res = (obj as ResumptionInternal<Res, Ret>).getOrThrow()
-                        let resp = res.responseHolder.load()
-                        let responseVal = resp.r
-                        this.resumption = None
-                        responseVal.unpack<R1>()
-                    case None => throw Exception("INTERNAL ERROR: missing pending resumption")
-                }
-            case None => None
+        if (let Some(cmd) <- (maybeCmd as Cmd)) {
+            this.command = cmd
+            this.resumption = ResumptionInternal<Res, Ret>(this)
+            let resumptionToUse = this.resumption.getOrThrow()
+            let pendingBox = PendingResumptionHolder.getPendingResumptionBox()
+            pendingBox.ref = (resumptionToUse as Object)
+            this.frame.request(Perform(this))
+            if (let Some(obj) <- PendingResumptionHolder.getPendingResumptionBox().ref) {
+                pendingBox.ref = None
+                let res = (obj as ResumptionInternal<Res, Ret>).getOrThrow()
+                let resp = res.responseHolder.load()
+                let responseVal = resp.r
+                this.resumption = None
+                responseVal.unpack<R1>()
+            } else {
+                throw Exception("INTERNAL ERROR: missing pending resumption")
+            }
+        } else {
+            None
         }
     }
 
@@ -211,12 +211,12 @@ internal class DeferredFrame<Ret> <: HandlerFrame {
             }
         }
         unsafe { CJ_MRT_ThreadWait() }
-        match (PendingFrameHolder.getPendingFrameBox().ref) {
-            case Some(obj) =>
-                pendingFrameBox.ref = None
-                let frame = (obj as DeferredFrame<Ret>).getOrThrow()
-                frame.mainLoop()
-            case None => throw Exception("INTERNAL ERROR: missing pending frame")
+        if (let Some(obj) <- PendingFrameHolder.getPendingFrameBox().ref) {
+            pendingFrameBox.ref = None
+            let frame = (obj as DeferredFrame<Ret>).getOrThrow()
+            frame.mainLoop()
+        } else {
+            throw Exception("INTERNAL ERROR: missing pending frame")
         }
     }
 
