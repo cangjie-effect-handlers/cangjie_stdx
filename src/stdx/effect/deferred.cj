@@ -64,7 +64,7 @@ foreign func CJ_MRT_ThreadReady(readyThread: ThreadHandle): Unit
 foreign func CJ_MRT_GetCJThreadState(thread: ThreadHandle): Int64
 
 enum HandlerResponse<Res> {
-    Invalid | Resume(Res) | Throw(Exception) | Abort(Error)
+    Resume(Res) | Throw(Exception) | Abort(Error) | Invalid
 }
 
 // Box used so handler's write to response is visible to handlee via atomic store/load (memory ordering).
