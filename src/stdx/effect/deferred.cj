@@ -8,9 +8,45 @@
 
 package stdx.effect
 
-internal import std.sync.AtomicBool
+internal import std.sync.{AtomicBool, AtomicReference}
 
 private type ThreadHandle = CPointer<Unit>
+
+// Thread-local capture of resumption before request(); read after wake so we never rely on this.resumption after the handler runs.
+private class PendingResumptionBox {
+    var ref: Option<Object> = None
+    init() {}
+}
+private class PendingResumptionHolder {
+    static let PENDING_RESUMPTION_KEY = ThreadLocal<PendingResumptionBox>()
+    static func getPendingResumptionBox(): PendingResumptionBox {
+        match (PENDING_RESUMPTION_KEY.get()) {
+            case Some(box) => box
+            case None =>
+                let box = PendingResumptionBox()
+                PENDING_RESUMPTION_KEY.set(box)
+                box
+        }
+    }
+}
+
+// Thread-local capture of frame before ThreadWait(); read after wake so handler never relies on this (frame) after resume.
+private class PendingFrameBox {
+    var ref: Option<Object> = None
+    init() {}
+}
+private class PendingFrameHolder {
+    static let PENDING_FRAME_KEY = ThreadLocal<PendingFrameBox>()
+    static func getPendingFrameBox(): PendingFrameBox {
+        match (PENDING_FRAME_KEY.get()) {
+            case Some(box) => box
+            case None =>
+                let box = PendingFrameBox()
+                PENDING_FRAME_KEY.set(box)
+                box
+        }
+    }
+}
 
 @FastNative
 foreign func CJ_MRT_GetCurrentCJThread(): ThreadHandle
@@ -31,6 +67,22 @@ enum HandlerResponse<Res> {
     Resume(Res) | Throw(Exception) | Abort(Error) | Invalid
 }
 
+// Box used so handler's write to response is visible to handlee via atomic store/load (memory ordering).
+internal class ResponseBox<Res> {
+    var r: HandlerResponse<Res> = Invalid
+    init(r: HandlerResponse<Res>) {
+        this.r = r
+    }
+}
+
+// Box used so handlee's write to request is visible to handler via atomic store/load (memory ordering).
+internal class RequestBox<Ret> {
+    var r: HandlerRequest<Ret> = HandlerRequest<Ret>.Invalid
+    init(r: HandlerRequest<Ret>) {
+        this.r = r
+    }
+}
+
 extend<Res> HandlerResponse<Res> {
     func unpack<R1>(): R1 {
         match (this) {
@@ -45,6 +97,8 @@ extend<Res> HandlerResponse<Res> {
 internal class ResumptionInternal<Res, Ret> <: Resumption<Res, Ret> {
     let used = AtomicBool(false)
     let waitingThread = unsafe { CJ_MRT_GetCurrentCJThread() }
+    // Response lives here so handlee reads from the same object it holds (this.resumption), avoiding handler-case visibility/corruption.
+    var responseHolder = AtomicReference<ResponseBox<Res>>(ResponseBox<Res>(HandlerResponse<Res>.Invalid))
     ResumptionInternal(let handler: DeferredHandlerCase1<Res, Ret>) {}
 
     func respond(r: HandlerResponse<Res>): Ret {
@@ -52,7 +106,9 @@ internal class ResumptionInternal<Res, Ret> <: Resumption<Res, Ret> {
         if (this.used.swap(true)) {
             throw DoubleResumeException()
         }
-        this.handler.response = r
+        let box = this.responseHolder.load()
+        box.r = r
+        this.responseHolder.store(box)
         this.handler.frame.parent = HandlerFrame.getActiveFrame()
         this.handler.frame.handlerThread = unsafe { CJ_MRT_GetCurrentCJThread() }
         unsafe { CJ_MRT_ThreadResumeAndWait(this.waitingThread) }
@@ -81,7 +137,6 @@ abstract class DeferredHandlerCase0<Ret> <: HandlerCase {
 
 abstract class DeferredHandlerCase1<Res, Ret> <: DeferredHandlerCase0<Ret> {
     DeferredHandlerCase1(let frame: DeferredFrame<Ret>) {}
-    var response: HandlerResponse<Res> = Invalid
 }
 
 class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
@@ -92,13 +147,25 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
     var resumption: Option<ResumptionInternal<Res, Ret>> = None
     protected override func tryHandle<R1>(maybeCmd: Command<R1>, box!: FrameBox): Option<R1> {
         // EXECUTED BY HANDLEE
-        match (maybeCmd as Cmd) {
-            case Some(cmd) =>
-                this.command = cmd
-                this.resumption = ResumptionInternal<Res, Ret>(this)
-                this.frame.request(Perform(this))
-                this.response.unpack<R1>()
-            case None => None
+        if (let Some(cmd) <- (maybeCmd as Cmd)) {
+            this.command = cmd
+            this.resumption = ResumptionInternal<Res, Ret>(this)
+            let resumptionToUse = this.resumption.getOrThrow()
+            let pendingBox = PendingResumptionHolder.getPendingResumptionBox()
+            pendingBox.ref = (resumptionToUse as Object)
+            this.frame.request(Perform(this))
+            if (let Some(obj) <- PendingResumptionHolder.getPendingResumptionBox().ref) {
+                pendingBox.ref = None
+                let res = (obj as ResumptionInternal<Res, Ret>).getOrThrow()
+                let resp = res.responseHolder.load()
+                let responseVal = resp.r
+                this.resumption = None
+                responseVal.unpack<R1>()
+            } else {
+                throw Exception("INTERNAL ERROR: missing pending resumption")
+            }
+        } else {
+            None
         }
     }
 
@@ -107,7 +174,7 @@ class DeferredHandlerCase<Cmd, Res, Ret> <: DeferredHandlerCase1<Res, Ret> {
         let cmd = this.command.getOrThrow()
         this.command = None
         let res = this.resumption.getOrThrow()
-        this.resumption = None
+        // Do not clear this.resumption here; handlee reads response from res, then respond() clears it.
         this.h(cmd, res)
     }
 }
@@ -123,12 +190,14 @@ enum HandlerRequest<Ret> {
 internal class DeferredFrame<Ret> <: HandlerFrame {
     var handlerThread = unsafe { CJ_MRT_GetCurrentCJThread() }
     var handleeThread = ThreadHandle()
-    var handlerRequest: HandlerRequest<Ret> = Invalid
+    var requestHolder = AtomicReference<RequestBox<Ret>>(RequestBox<Ret>(HandlerRequest<Ret>.Invalid))
 
     public DeferredFrame(let fn: () -> Ret) {}
     public func start(): Ret {
         // EXECUTED BY HANDLER
         this.parent = HandlerFrame.getActiveFrame()
+        let pendingFrameBox = PendingFrameHolder.getPendingFrameBox()
+        pendingFrameBox.ref = (this as Object)
         spawn {
             // EXECUTED BY HANDLEE
             this.handleeThread = unsafe { CJ_MRT_GetCurrentCJThread() }
@@ -142,13 +211,21 @@ internal class DeferredFrame<Ret> <: HandlerFrame {
             }
         }
         unsafe { CJ_MRT_ThreadWait() }
-        this.mainLoop()
+        if (let Some(obj) <- PendingFrameHolder.getPendingFrameBox().ref) {
+            pendingFrameBox.ref = None
+            let frame = (obj as DeferredFrame<Ret>).getOrThrow()
+            frame.mainLoop()
+        } else {
+            throw Exception("INTERNAL ERROR: missing pending frame")
+        }
     }
 
     func mainLoop(): Ret {
         // EXECUTED BY HANDLER
         this.parent = HandlerFrame.getActiveFrame()
-        match (this.handlerRequest) {
+        let box = this.requestHolder.load()
+        let requestVal = box.r
+        match (requestVal) {
             case Perform(handlerCase) => handlerCase.fulfill()
             case Return(ret) =>
                 unsafe { CJ_MRT_ThreadReady(handleeThread) }
@@ -172,7 +249,9 @@ internal class DeferredFrame<Ret> <: HandlerFrame {
 
     func request(req: HandlerRequest<Ret>) {
         // EXECUTED BY HANDLEE
-        this.handlerRequest = req
+        let box = this.requestHolder.load()
+        box.r = req
+        this.requestHolder.store(box)
         // The number 3 is the internal representation for the "Pending" thread
         // state. The ThreadState method to parse an integer into an explicit enum
         // is not public at time of writing.
